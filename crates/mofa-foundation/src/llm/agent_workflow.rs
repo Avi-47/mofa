@@ -41,11 +41,14 @@
 
 use super::agent::LLMAgent;
 use super::types::{LLMError, LLMResult};
+use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::task;
 
 /// Agent 工作流节点类型
 /// Agent workflow node types
@@ -169,6 +172,17 @@ pub type JoinFn = Arc<
         + Send
         + Sync,
 >;
+
+/// Extract panic message from panic payload.
+/// Extracts the panic message from a boxed Any type.
+fn extract_panic_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .or_else(|| payload.downcast_ref::<()>().map(|_| "Unknown panic".to_string()))
+        .unwrap_or_else(|| "Unknown panic type".to_string())
+}
 
 /// Agent 工作流节点
 /// Agent workflow node
@@ -597,14 +611,17 @@ impl AgentWorkflow {
             // 确定下一个节点
             // Determine next node
             match self.get_next_node(ctx, &current_node_id, &output).await {
-                Some(next_id) => {
+                Ok(Some(next_id)) => {
                     current_node_id = next_id;
                     current_input = output;
                 }
-                None => {
+                Ok(None) => {
                     // 工作流结束
                     // Workflow finished
                     return Ok(output);
+                }
+                Err(e) => {
+                    return Err(e);
                 }
             }
         }
@@ -662,11 +679,39 @@ impl AgentWorkflow {
                     .router
                     .as_ref()
                     .ok_or_else(|| LLMError::Other("Router function not set".to_string()))?;
-                let route = router(input.clone()).await;
-                ctx.set_router_decision(&node.id, &route).await;
-                // 路由节点返回原输入，路由决策在 get_next_node 中使用
-                // Router returns original input; decision is used in get_next_node
-                Ok(input)
+                
+                // Wrap in panic catch_unwind to contain user code panics
+                let router = router.clone();
+                let node_id = node.id.clone();
+                let workflow_id = self.id.clone();
+                let input_clone = input.clone();
+                let route_result = tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(router(input_clone))
+                }).await;
+                
+                match route_result {
+                    Ok(route) => {
+                        ctx.set_router_decision(&node.id, &route).await;
+                        // 路由节点返回原输入，路由决策在 get_next_node 中使用
+                        // Router returns original input; decision is used in get_next_node
+                        Ok(input)
+                    }
+                    Err(join_error) => {
+                        // This handles both panics in the blocking task and join errors
+                        let panic_msg = join_error.to_string();
+                        tracing::error!(
+                            workflow_id = %workflow_id,
+                            node_id = %node_id,
+                            error = %panic_msg,
+                            "Router function panicked"
+                        );
+                        Err(LLMError::Other(format!(
+                            "Router node '{}' panicked: {}",
+                            node_id, panic_msg
+                        )))
+                    }
+                }
             }
 
             AgentNodeType::Parallel => {
@@ -681,7 +726,31 @@ impl AgentWorkflow {
                 let outputs = ctx.get_outputs(&node.wait_for).await;
 
                 if let Some(ref join_fn) = node.join_fn {
-                    Ok(join_fn(outputs).await)
+                    // Wrap in panic catch_unwind to contain user code panics
+                    let node_id = node.id.clone();
+                    let workflow_id = self.id.clone();
+                    let join_fn = join_fn.clone();
+                    let join_result = tokio::task::spawn_blocking(move || {
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(join_fn(outputs))
+                    }).await;
+                    
+                    match join_result {
+                        Ok(result) => Ok(result),
+                        Err(join_error) => {
+                            let panic_msg = join_error.to_string();
+                            tracing::error!(
+                                workflow_id = %workflow_id,
+                                node_id = %node_id,
+                                error = %panic_msg,
+                                "Join function panicked"
+                            );
+                            Err(LLMError::Other(format!(
+                                "Join node '{}' panicked: {}",
+                                node_id, panic_msg
+                            )))
+                        }
+                    }
                 } else {
                     // 默认聚合：合并所有文本输出
                     // Default aggregation: merge all text outputs
@@ -695,7 +764,33 @@ impl AgentWorkflow {
                     .transform
                     .as_ref()
                     .ok_or_else(|| LLMError::Other("Transform function not set".to_string()))?;
-                Ok(transform(input).await)
+                
+                // Wrap in panic catch_unwind to contain user code panics
+                let transform = transform.clone();
+                let node_id = node.id.clone();
+                let workflow_id = self.id.clone();
+                let input_val = input;
+                let transform_result = tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(transform(input_val))
+                }).await;
+                
+                match transform_result {
+                    Ok(result) => Ok(result),
+                    Err(join_error) => {
+                        let panic_msg = join_error.to_string();
+                        tracing::error!(
+                            workflow_id = %workflow_id,
+                            node_id = %node_id,
+                            error = %panic_msg,
+                            "Transform function panicked"
+                        );
+                        Err(LLMError::Other(format!(
+                            "Transform node '{}' panicked: {}",
+                            node_id, panic_msg
+                        )))
+                    }
+                }
             }
         }
     }
@@ -707,16 +802,20 @@ impl AgentWorkflow {
         ctx: &AgentWorkflowContext,
         current_id: &str,
         output: &AgentValue,
-    ) -> Option<String> {
-        let node = self.nodes.get(current_id)?;
+    ) -> LLMResult<Option<String>> {
+        let node = self.nodes.get(current_id).ok_or_else(|| {
+            LLMError::Other(format!("Node '{}' not found in workflow", current_id))
+        })?;
 
         // 结束节点没有后续
         // End node has no successor
         if matches!(node.node_type, AgentNodeType::End) {
-            return None;
+            return Ok(None);
         }
 
-        let edges = self.adjacency.get(current_id)?;
+        let edges = self.adjacency.get(current_id).ok_or_else(|| {
+            LLMError::Other(format!("No edges found for node '{}'", current_id))
+        })?;
 
         // 路由节点：根据路由函数结果选择边
         // Router node: select edge based on router function result
@@ -724,29 +823,57 @@ impl AgentWorkflow {
             let route = match ctx.get_router_decision(current_id).await {
                 Some(route) => route,
                 None => {
-                    let router = node.router.as_ref()?;
-                    router(output.clone()).await
+                    let router = node.router.as_ref().ok_or_else(|| {
+                        LLMError::Other("Router function not set".to_string())
+                    })?;
+                    
+                    // Wrap in panic catch_unwind to contain user code panics
+                    let router = router.clone();
+                    let output_clone = output.clone();
+                    let node_id = node.id.clone();
+                    let workflow_id = self.id.clone();
+                    let router_result = tokio::task::spawn_blocking(move || {
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(router(output_clone))
+                    }).await;
+                    
+                    match router_result {
+                        Ok(route) => route,
+                        Err(join_error) => {
+                            let panic_msg = join_error.to_string();
+                            tracing::error!(
+                                workflow_id = %workflow_id,
+                                node_id = %node_id,
+                                error = %panic_msg,
+                                "Router function panicked in get_next_node"
+                            );
+                            return Err(LLMError::Other(format!(
+                                "Router node '{}' panicked: {}",
+                                node_id, panic_msg
+                            )));
+                        }
+                    }
                 }
             };
 
             for edge in edges {
                 if edge.condition.as_ref() == Some(&route) {
-                    return Some(edge.to.clone());
+                    return Ok(Some(edge.to.clone()));
                 }
             }
             // 如果没有匹配的条件边，使用默认边（无条件）
             // If no conditional edge matches, use the default unconditional edge
             for edge in edges {
                 if edge.condition.is_none() {
-                    return Some(edge.to.clone());
+                    return Ok(Some(edge.to.clone()));
                 }
             }
-            return None;
+            return Ok(None);
         }
 
         // 非路由节点：使用第一条边
         // Non-router node: use the first available edge
-        edges.first().map(|e| e.to.clone())
+        Ok(edges.first().map(|e| e.to.clone()))
     }
 
     /// 获取节点
@@ -1245,5 +1372,115 @@ mod tests {
         assert!(workflow.get_node("step1").is_some());
         assert!(workflow.get_node("step2").is_some());
         assert!(workflow.get_node("step3").is_some());
+    }
+
+    /// Test that panic in TransformFn is caught and returns an error
+    #[tokio::test]
+    async fn test_transform_fn_panic_is_contained() {
+        let workflow = AgentWorkflowBuilder::new("panic-transform-test")
+            .add_transform("panicking", |_input: AgentValue| {
+                async move {
+                    panic!("Transform panic message");
+                }
+            })
+            .chain(["panicking"])
+            .build();
+
+        let result = workflow.run("test input").await;
+        
+        // Should return error, not panic
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("panicking"));
+        assert!(err_msg.contains("Transform panic message"));
+    }
+
+    /// Test that panic in RouterFn is caught and returns an error
+    #[tokio::test]
+    async fn test_router_fn_panic_is_contained() {
+        let workflow = AgentWorkflowBuilder::new("panic-router-test")
+            .add_router("panicking_router", |_input: AgentValue| {
+                async move {
+                    panic!("Router panic message");
+                }
+            })
+            .add_transform("left", |input: AgentValue| async move {
+                AgentValue::Text(format!("left:{}", input.into_text()))
+            })
+            .add_transform("right", |input: AgentValue| async move {
+                AgentValue::Text(format!("right:{}", input.into_text()))
+            })
+            .connect("start", "panicking_router")
+            .connect_on("panicking_router", "left", "left")
+            .connect_on("panicking_router", "right", "right");
+
+        let mut workflow = workflow;
+        workflow.nodes.insert("end".to_string(), AgentNode::end());
+        let workflow = workflow
+            .connect("left", "end")
+            .connect("right", "end")
+            .build();
+
+        let result = workflow.run("test input").await;
+        
+        // Should return error, not panic
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("panicking_router"));
+        assert!(err_msg.contains("Router panic message"));
+    }
+
+    /// Test that panic in JoinFn is caught and returns an error
+    #[tokio::test]
+    async fn test_join_fn_panic_is_contained() {
+        let workflow = AgentWorkflowBuilder::new("panic-join-test")
+            .add_transform("task1", |input: AgentValue| async move {
+                AgentValue::Text(format!("task1:{}", input.into_text()))
+            })
+            .add_transform("task2", |input: AgentValue| async move {
+                AgentValue::Text(format!("task2:{}", input.into_text()))
+            })
+            .add_parallel("parallel")
+            .add_join_with("aggregator", vec!["task1", "task2"], |_inputs| {
+                async move {
+                    panic!("Join panic message");
+                }
+            })
+            .connect("start", "parallel")
+            .connect("parallel", "task1")
+            .connect("parallel", "task2")
+            .connect("task1", "aggregator")
+            .connect("task2", "aggregator");
+
+        let mut workflow = workflow;
+        workflow.nodes.insert("end".to_string(), AgentNode::end());
+        let workflow = workflow.connect("aggregator", "end").build();
+
+        let result = workflow.run("test input").await;
+        
+        // Should return error, not panic
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("aggregator"));
+        assert!(err_msg.contains("Join panic message"));
+    }
+
+    /// Test that panic message extraction works for different types
+    #[test]
+    fn test_extract_panic_message() {
+        // Test with &str payload
+        let payload: Box<dyn std::any::Any + Send> = Box::new("test panic");
+        assert_eq!(extract_panic_message(payload), "test panic");
+        
+        // Test with String payload
+        let payload: Box<dyn std::any::Any + Send> = Box::new("string panic".to_string());
+        assert_eq!(extract_panic_message(payload), "string panic");
+        
+        // Test with unknown type
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(extract_panic_message(payload), "Unknown panic type");
     }
 }
